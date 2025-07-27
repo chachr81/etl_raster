@@ -1,0 +1,8 @@
+nohup: ignoring input
+/home/dps_chanar/etl_raster/dem_etl.py: 1: import: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 2: import: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 3: import: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 4: from: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 5: import: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 6: from: not found
+/home/dps_chanar/etl_raster/dem_etl.py: 9: Syntax error: "(" unexpected
