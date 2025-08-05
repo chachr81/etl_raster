@@ -1,0 +1,20 @@
+nohup: ignoring input
+[1/5] Configurando rutas y mapeo de clases...
+[✓] Stack ya existe en: /home/dps_chanar/raster_data/humedales_giz/stack_humedales.tif, se reutiliza.
+[3/5] Cargando stack en xarray...
+
+Validando bandas TIFF:   0%|          | 0/10 [00:00<?, ?it/s]
+Validando bandas TIFF:  10%|█         | 1/10 [08:00<1:12:01, 480.20s/it]
+Validando bandas TIFF:  20%|██        | 2/10 [09:47<34:45, 260.69s/it]  
+Validando bandas TIFF:  30%|███       | 3/10 [14:35<31:53, 273.33s/it]
+Validando bandas TIFF:  40%|████      | 4/10 [18:41<26:15, 262.53s/it]
+Validando bandas TIFF:  50%|█████     | 5/10 [22:37<21:05, 253.11s/it]
+Validando bandas TIFF:  60%|██████    | 6/10 [26:57<17:01, 255.35s/it]
+Validando bandas TIFF:  70%|███████   | 7/10 [31:02<12:35, 251.86s/it]
+Validando bandas TIFF:  80%|████████  | 8/10 [35:09<08:20, 250.43s/it]
+Validando bandas TIFF:  90%|█████████ | 9/10 [39:31<04:13, 253.89s/it]
+Validando bandas TIFF: 100%|██████████| 10/10 [43:36<00:00, 251.12s/it]
+Validando bandas TIFF: 100%|██████████| 10/10 [43:36<00:00, 261.62s/it]
+
+Guardando NetCDF:   0%|          | 0/1 [00:00<?, ?it/s]en /home/dps_chanar/raster_data/humedales_giz/stack_humedales.nc con compresión...
+ 

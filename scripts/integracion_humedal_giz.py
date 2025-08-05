@@ -1,207 +1,223 @@
 # -*- coding: utf-8 -*-
 """
-Script para:
-1. Crear stack multibanda a partir de TIFFs anuales.
-2. Convertirlo a xarray.DataArray con coordenadas temporales.
-3. Guardar en formato NetCDF (.nc) con compresión.
-4. Extraer clases válidas por año (paralelo, bajo RAM).
-5. Generar violinplot con la evolución de clases.
+Muestreo estratificado optimizado por bloques (1024×1024) desde stack multibanda.
 
-Autor: Christian Chacón (versión final optimizada)
+Christian Chacón · agosto 2025
 """
 
 import os
+import uuid
 import numpy as np
-import pandas as pd
+import geoalchemy2
 import rasterio
-import rioxarray
-import xarray as xr
-from collections import defaultdict
-from collections import Counter
-from dask.diagnostics.progress import ProgressBar
-import matplotlib.pyplot as plt
-import seaborn as sns
+from rasterio.windows import Window
+from shapely.geometry import Point
+import geopandas as gpd
+from sqlalchemy import create_engine, text
+from dotenv import dotenv_values
 from tqdm import tqdm
+from collections import defaultdict
+import logging
 
-# ==========================================
-# [1/5] CONFIGURACIÓN INICIAL
-# ==========================================
+# ==========================
+# [1] CONFIGURACIÓN GENERAL
+# ==========================
 
-print("[1/5] Configurando rutas y mapeo de clases...")
+os.makedirs(os.path.expanduser("/home/dps_chanar/etl_raster/logs/"), exist_ok=True)
+logging.basicConfig(
+    filename=os.path.expanduser("/home/dps_chanar/etl_raster/logs/muestreo_humedales.log"),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+logging.info("[1/7] Cargando configuración...")
+
+input_tif = os.path.expanduser("/home/dps_chanar/raster_data/humedales_giz/stack_humedales.tif")
+env = dotenv_values(os.path.expanduser("/home/dps_chanar/.env"))
+pg_url = f"postgresql://{env['DB_USER_P']}:{env['DB_PASSWORD_P']}@{env['DB_HOST_P']}/{env['DB_NAME_P']}"
+engine = create_engine(pg_url)
+output_table = "ecos_acuatico_continental.muestreo_humedales_giz"
+
+anios = list(range(2015, 2025))
+bandas_idx = list(range(1, 11))  # rasterio is 1-based
+chunk_size = 1024
+porcentaje = 0.10
+valores_validos = set(range(1, 14))
+bloque_insercion = 500_000
 
 pixel_class_map = {
     1: "Superficie agrícola", 2: "Superficie arbórea", 3: "Superficie herbácea",
     4: "Superficie arbustiva y estepas leñosas", 5: "Superficies artificiales",
     6: "Vegetación dispersa", 7: "Suelo desnudo", 8: "Hielo y nieve",
-    9: "Mares y océanos", 10: "Turberas Sphagnosas", 11: "Turberas Sphagnosas y/o Pulvinadas",
-    12: "Vegas y mallines", 13: "Cuerpos de agua continental"
+    9: "Mares y océanos", 10: "Turberas Sphagnosas",
+    11: "Turberas Sphagnosas y/o Pulvinadas", 12: "Vegas y mallines",
+    13: "Cuerpos de agua continental"
 }
 
-input_dir = os.path.expanduser("~/raster_data/humedales_giz")
-stack_path = os.path.join(input_dir, "stack_humedales.tif")
-nc_path = os.path.join(input_dir, "stack_humedales.nc")
+# ==========================
+# [2] LEER METADATOS
+# ==========================
 
-raster_files = {
-    2015: "bb97bc4d-3490-4d50-9de4-2409a160c48e.tif", 2016: "3b342275-80e1-41dc-b10b-bbfec3d959d3.tif",
-    2017: "2770a8a2-612c-4e00-b3f2-b8b48bd7d4f6.tif", 2018: "cfb82bc7-a213-4958-af4d-4a7bbf49230c.tif",
-    2019: "abf4e94b-abb4-4937-a1a6-cf5be31d7619.tif", 2020: "efbde6dd-0e3e-49a2-99a9-9e84ea09b06e.tif",
-    2021: "e75459aa-5d85-4a82-b566-12819c8f3412.tif", 2022: "af2683cb-f449-487c-bda7-9cae9ff67086.tif",
-    2023: "a781d13a-f64e-426a-894b-b30724f88bc0.tif", 2024: "3f25ffed-3c4b-4901-9b63-5a58d45300c9.tif"
-}
-anios = sorted(raster_files.keys())
+logging.info("[2/7] Leyendo metadatos del stack...")
 
-# ==========================================
-# [2/5] CREACIÓN DE STACK MULTIBANDA
-# ==========================================
+with rasterio.open(input_tif) as src:
+    nodata = src.nodata
+    width, height = src.width, src.height
+    crs = src.crs
+    epsg = crs.to_epsg()
 
-if not os.path.exists(stack_path):
-    print("[2/5] Generando stack multibanda...")
-    primer_raster = os.path.join(input_dir, raster_files[anios[0]])
+logging.info(f"[2/7] Stack multibanda detectado con tamaño {height}x{width}, nodata={nodata}, EPSG={epsg}")
 
-    with rasterio.open(primer_raster) as src0:
-        meta = src0.meta.copy()
-        meta.update(count=len(anios), dtype=src0.dtypes[0], nodata=src0.nodata)
+# ==========================
+# [3] PROCESAMIENTO POR BLOQUES
+# ==========================
 
-        with rasterio.open(stack_path, "w", **meta) as dst:
-            for i, anio in tqdm(enumerate(anios), total=len(anios), desc="Apilando bandas"):
-                path_raster = os.path.join(input_dir, raster_files[anio])
-                with rasterio.open(path_raster) as src:
-                    dst.write(src.read(1), i + 1)
-    print(f"[✓] Stack guardado en: {stack_path}")
-else:
-    print(f"[✓] Stack ya existe en: {stack_path}, se reutiliza.")
+logging.info("[3/7] Buscando píxeles válidos por bloque...")
 
-# ==========================================
-# [3/5] CARGA EN XARRAY Y GUARDADO NETCDF
-# ==========================================
+candidatos_por_clase = defaultdict(list)
 
-print("[3/5] Cargando stack en xarray...")
+with rasterio.open(input_tif) as src:
+    for row_off in tqdm(range(0, height, chunk_size), desc="Filas"):
+        for col_off in range(0, width, chunk_size):
+            win = Window(col_off, row_off,
+                         min(chunk_size, width - col_off),
+                         min(chunk_size, height - row_off))
 
-try:
-    if os.path.exists(nc_path):
-        print(f"[✓] NetCDF ya existe en: {nc_path}, cargando directamente con chunks...")
+            bloques = [src.read(bidx, window=win) for bidx in bandas_idx]
+            stack = np.stack(bloques, axis=0)
+            validez = ((stack != nodata) & np.isfinite(stack) & (stack >= 1) & (stack <= 13)).all(axis=0)
+            base = bloques[0]
+            rows, cols = np.where(validez)
 
-        ds = xr.open_dataset(nc_path, chunks={"anio": 1})
-        da = ds["clase"]
+            for r, c in zip(rows, cols):
+                clase_base = int(base[r, c])
+                if clase_base in valores_validos:
+                    abs_row = row_off + r
+                    abs_col = col_off + c
+                    candidatos_por_clase[clase_base].append((abs_row, abs_col))
 
-        # Aplicar máscara para ignorar nodata
-        da = da.where(da != -127)
+logging.info("[3/7] Índices válidos por clase recopilados.")
 
-        # Vista rápida del contenido para validación
-        print("\n Preview del NetCDF:")
-        print(f"  Dimensiones: {da.dims}")
-        print(f"  Coordenadas: {list(da.coords)}")
-        print(f"  Tipo de datos: {da.dtype}")
-        print(f"  Chunking (Dask): {da.chunks}")
-        print(f"  Valor nodata aplicado: -127\n")
+# ==========================
+# [4] MUESTREO ESTRATIFICADO
+# ==========================
 
-    else:
-        print("[i] NetCDF no encontrado. Cargando stack TIFF con chunks...")
+logging.info("[4/7] Muestreo aleatorio estratificado por clase (10%)...")
 
-        da_raw = rioxarray.open_rasterio(stack_path, chunks={"band": 1, "x": 512, "y": 512})
+muestras_idx = []
+for clase, lista_indices in candidatos_por_clase.items():
+    total = len(lista_indices)
+    if total == 0:
+        continue
+    n_sample = max(1, int(round(total * porcentaje)))
+    seleccion = np.random.choice(range(total), size=n_sample, replace=False)
+    for idx in seleccion:
+        row, col = lista_indices[idx]
+        muestras_idx.append((clase, row, col))
 
-        if isinstance(da_raw, list):
-            raise ValueError("La lectura del stack devolvió una lista. Verifica el archivo TIFF.")
+logging.info(f"[4/7] Total puntos muestreados: {len(muestras_idx):,}")
 
-        da = da_raw.squeeze(dim="spatial_ref", drop=True) if "spatial_ref" in da_raw.dims else da_raw
+# ==========================
+# [4.5] UUIDs YA INSERTADOS
+# ==========================
 
-        if "band" not in da.dims:
-            raise ValueError("El stack no tiene dimensión 'band'.")
+def obtener_uuids_existentes(engine, tabla_completa):
+    esquema, tabla = tabla_completa.split(".")
+    with engine.connect() as conn:
+        try:
+            existe = conn.execute(text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = :esquema AND table_name = :tabla
+                )
+            """), {"esquema": esquema, "tabla": tabla}).scalar()
+            
+            if not existe:
+                logging.warning(f"[!] La tabla '{tabla_completa}' no existe aún. Continuando sin filtrar UUIDs.")
+                return set()
+            
+            result = conn.execute(text(f"SELECT DISTINCT uuid_muestra FROM {tabla_completa}"))
+            return set(row[0] for row in result)
+        
+        except Exception as e:
+            logging.warning(f"[!] Error inesperado al consultar UUIDs existentes: {e}")
+            return set()
 
-        if len(da.coords["band"]) != len(anios):
-            raise ValueError("Número de bandas no coincide con años.")
+def uuid_determinista(row, col):
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{row}_{col}"))
 
-        # Renombrar banda y aplicar coordenadas
-        da = da.rename(band="anio").assign_coords(anio=anios)
+logging.info("[4.5/7] Consultando UUIDs ya insertados...")
+uuids_existentes = obtener_uuids_existentes(engine, output_table)
+logging.info(f"[4.5/7] UUIDs encontrados en BD: {len(uuids_existentes):,}")
 
-        # Aplicar máscara para nodata
-        da = da.where(da != -127)
+logging.info("[4.6/7] Filtrando muestras ya insertadas...")
 
-        print(f"[✓] Guardando stack como NetCDF en: {nc_path}")
-        da.to_dataset(name="clase").to_netcdf(
-            nc_path,
-            encoding={
-                "clase": {
-                    "zlib": True,
-                    "complevel": 4,
-                    "_FillValue": -127
-                }
-            },
-            format="NETCDF4"
-        )
+muestras_filtradas = []
+for clase, row, col in muestras_idx:
+    uid = uuid_determinista(row, col)
+    if uid not in uuids_existentes:
+        muestras_filtradas.append((clase, row, col, uid))
 
-except Exception as e:
-    print(f"[✗] Error al cargar stack o guardar NetCDF: {e}")
-    exit(1)
+logging.info(f"[4.6/7] Puntos nuevos a procesar: {len(muestras_filtradas):,}")
 
-# ==========================================
-# [4/5] EXTRACCIÓN DE CLASES POR AÑO (EFICIENTE)
-# ==========================================
+# ==========================
+# [5/7] EXTRACCIÓN E INSERCIÓN POR BLOQUES
+# ==========================
 
-print("[4/5] Extrayendo clases por año (procesamiento eficiente sin saturar RAM)...")
+logging.info("[5/7] Extrayendo valores multitemporales e insertando por bloques...")
 
-valores = []
-height, width = da.sizes["y"], da.sizes["x"]
-block_size = 512
+registros = []
+contador_insertados = 0
 
-for i, anio in tqdm(enumerate(anios), total=len(anios), desc="Extrayendo clases"):
-    capa = da.isel(anio=i)
-    conteo_clases = defaultdict(int)
+with rasterio.open(input_tif) as src:
+    for idx, (clase_id, row, col, uuid_m) in enumerate(tqdm(muestras_filtradas, desc="Procesando puntos")):
+        try:
+            x, y = src.xy(row, col, offset="center")
+            clase_nombre = pixel_class_map.get(clase_id, f"Clase {clase_id}")
 
-    for row_off in range(0, height, block_size):
-        for col_off in range(0, width, block_size):
-            window = dict(
-                y=slice(row_off, min(row_off + block_size, height)),
-                x=slice(col_off, min(col_off + block_size, width))
-            )
+            for i, anio in enumerate(anios):
+                val = src.read(i + 1, window=Window(col, row, 1, 1))[0, 0]
+                registros.append({
+                    "uuid_muestra": uuid_m,
+                    "year": anio,
+                    "clase_referencia": clase_nombre,
+                    "valor": int(val),
+                    "x": float(x),
+                    "y": float(y),
+                    "geometria": Point(float(x), float(y))
+                })
 
-            # Extraer bloque como numpy array
-            bloque = capa.isel(**window).data.compute()
+        except Exception as e:
+            logging.warning(f"[!] Error extrayendo punto ({row}, {col}) o banda {i + 1}: {e}")
+            continue
 
-            # Filtrado robusto: elimina NaN, infinitos, nodata (-127) y clases fuera de rango
-            bloque = bloque[np.isfinite(bloque)]
-            bloque = bloque[bloque != -127]
-            bloque = bloque[(bloque >= 1) & (bloque <= 13)]
+        if len(registros) >= bloque_insercion:
+            gdf_bloque = gpd.GeoDataFrame(registros, geometry="geometria", crs=crs)
+            gdf_bloque.to_postgis("muestreo_humedales_giz", engine,
+                                  schema="ecos_acuatico_continental",
+                                  if_exists="append", index=False)
+            contador_insertados += len(registros)
+            logging.info(f"[5/7] Insertados acumulados: {contador_insertados:,}")
+            registros.clear()
 
-            if bloque.size > 0:
-                unicos, cuentas = np.unique(bloque.astype(int), return_counts=True)
-                for clase, count in zip(unicos, cuentas):
-                    conteo_clases[clase] += count
+# ==========================
+# [6/7] INSERTAR RESTANTES
+# ==========================
 
-    for clase, count in conteo_clases.items():
-        nombre_clase = pixel_class_map.get(clase, f"Clase {clase}")
-        valores.extend([(anio, nombre_clase)] * count)
+logging.info("[6/7] Insertando registros restantes...")
 
-df_violin = pd.DataFrame(valores, columns=["Año", "Clase"])
-print(df_violin.head(10))
+if registros:
+    gdf_final = gpd.GeoDataFrame(registros, geometry="geometria", crs=crs)
+    gdf_final.to_postgis("muestreo_humedales_giz", engine,
+                         schema="ecos_acuatico_continental",
+                         if_exists="append", index=False)
+    contador_insertados += len(registros)
+    logging.info(f"[6/7] Insertados acumulados (final): {contador_insertados:,}")
+    registros.clear()
 
-# # ==========================================
-# # [5/5] VIOLINPLOT – Distribución por clase y año
-# # ==========================================
+# ==========================
+# [7/7] CIERRE
+# ==========================
 
-# # Asegurar tipos correctos
-# df_violin["Clase"] = df_violin["Clase"].astype("Int64")
-# df_violin["Año"] = df_violin["Año"].astype("Int64")
-
-# # Verificar contenido antes de graficar
-# print("[✓] DataFrame para violinplot contiene:")
-# print(df_violin.head())
-
-# if not df_violin.empty:
-#     plt.figure(figsize=(10, 6))
-#     sns.violinplot(
-#         data=df_violin,
-#         x="Año",
-#         y="Clase",
-#         palette="Set3",
-#         inner="box",
-#         linewidth=1
-#     )
-#     plt.title("Distribución de clases por año (violín)")
-#     plt.xlabel("Año")
-#     plt.ylabel("Clase")
-#     plt.tight_layout()
-#     plt.savefig(input_dir, "violinplot_clases.png", dpi=300)
-#     plt.show()
-# else:
-#     print("[✗] El DataFrame `df_violin` está vacío. No se puede graficar.")
+logging.info(f"[7/7] Muestreo completo. Total registros insertados: {contador_insertados:,}")
+logging.info("[7/7] Proceso finalizado exitosamente.")
