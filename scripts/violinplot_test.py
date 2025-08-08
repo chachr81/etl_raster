@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from dotenv import dotenv_values
 from sqlalchemy import create_engine
 from tqdm import tqdm
@@ -13,7 +14,7 @@ from tqdm import tqdm
 
 print("[1/4] Cargando configuración...")
 
-N_PUNTOS_POR_CLASE_ANIO = 2000  # ← PARAMETRIZABLE
+N_PUNTOS_POR_CLASE_ANIO = 500  # ← PARAMETRIZABLE
 
 env = dotenv_values(os.path.expanduser("/home/dps_chanar/.env"))
 pg_url = f"postgresql://{env['DB_USER_P']}:{env['DB_PASSWORD_P']}@{env['DB_HOST_P']}/{env['DB_NAME_P']}"
@@ -70,27 +71,65 @@ print("[3/4] Generando gráfico de violines...")
 df_total["year"] = df_total["year"].astype(str)
 ordered_years = sorted(df_total["year"].unique())
 
-fig, axes = plt.subplots(nrows=1, ncols=10, figsize=(40, 6), sharey=True)
+# Mapeo de colores por clase
+pixel_class_map = {
+    1: "Superficie agrícola", 2: "Superficie arbórea", 3: "Superficie herbácea",
+    4: "Superficie arbustiva y estepas leñosas", 5: "Superficies artificiales",
+    6: "Vegetación dispersa", 7: "Suelo desnudo", 8: "Hielo y nieve",
+    9: "Mares y océanos", 10: "Turberas Sphagnosas",
+    11: "Turberas Sphagnosas y/o Pulvinadas", 12: "Vegas y mallines",
+    13: "Cuerpos de agua continental"
+}
+clases_ordenadas = [pixel_class_map[i] for i in range(1, 14)]
+
+palette = sns.color_palette("tab20", n_colors=13)
+color_dict = {clase: palette[i] for i, clase in enumerate(clases_ordenadas)}
+
+fig, axes = plt.subplots(nrows=1, ncols=len(ordered_years), figsize=(5 * len(ordered_years), 6), sharey=True)
+
+# Asegurar que axes sea iterable
+if len(ordered_years) == 1:
+    axes = [axes]
 
 for i, year in enumerate(tqdm(ordered_years, desc="Graficando subplots")):
     ax = axes[i]
     data_year = df_total[df_total["year"] == year]
-    sns.violinplot(data=data_year, x="clase_referencia", y="valor",
-                   ax=ax, scale="width", inner="box", linewidth=1)
+
+    if data_year.empty:
+        ax.set_title(f"Año {year} (sin datos)")
+        ax.axis("off")
+        continue
+
+    sns.violinplot(
+        data=data_year,
+        x="clase_referencia",
+        y="valor",
+        ax=ax,
+        scale="width",
+        inner="box",
+        linewidth=1,
+        hue="clase_referencia",
+        palette=color_dict,
+        order=clases_ordenadas
+    )
+
     ax.set_title(f"Año {year}", fontsize=12)
     ax.set_xlabel("")
+    ax.set_xticks([])  # Quitar etiquetas del eje x
+
     if i == 0:
         ax.set_ylabel("Valor de clase observada")
     else:
         ax.set_ylabel("")
-    ax.tick_params(axis='x', rotation=90)
 
-# Ajustar el layout para dejar espacio al título
-plt.tight_layout(rect=(0, 0, 1, 0.93))
+# Crear leyenda global
+handles = [mpatches.Patch(color=color_dict[clase], label=clase) for clase in clases_ordenadas]
+fig.legend(handles=handles, title="Clase de cobertura", loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.05))
 
-# Título global
+# Título general y ajuste de layout
+plt.tight_layout(rect=(0, 0.05, 1, 0.93))
 fig.suptitle(
-    f"Distribución por clase y año\nMuestra: {N_PUNTOS_POR_CLASE_ANIO} puntos por clase/año",
+    f"Distribución por clase y año Muestra: {N_PUNTOS_POR_CLASE_ANIO} puntos por clase/año",
     fontsize=14,
     bbox=dict(facecolor="white", edgecolor="black", boxstyle="round,pad=0.3")
 )
